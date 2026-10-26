@@ -419,7 +419,7 @@ End Module\n";
         assert_eq!(function["position"]["end_line"], 3);
         assert_eq!(
             function["position"]["end_col"],
-            "    End Function".len() as u64
+            "End Function".len() as u64
         );
     }
 
