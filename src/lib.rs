@@ -239,10 +239,14 @@ fn parse_nodes(
                 child_parent,
                 &format!("{}.{}", id_prefix, line_index),
             );
-            let end_line = children
-                .last()
-                .map(|child| child.end_line)
-                .unwrap_or(line_index as u32);
+            // parse_nodes consumes the matching End <declaration> line before returning.
+            // Use that real closing source line for the declaration extent rather than
+            // stopping at the last body child and borrowing the opening line's length.
+            let end_index = (*index)
+                .saturating_sub(1)
+                .min(lines.len().saturating_sub(1));
+            let end_line = end_index as u32;
+            let end_col = lines.get(end_index).map(|value| value.len()).unwrap_or(0) as u32;
             let mut node = RawNode {
                 id: format!("{}.{}", id_prefix, line_index),
                 node_type: node_type.to_string(),
@@ -250,7 +254,7 @@ fn parse_nodes(
                 start_line: line_index as u32,
                 start_col: indent_col(line),
                 end_line,
-                end_col: line.len() as u32,
+                end_col,
                 children,
                 parent_type: None,
             };
@@ -397,6 +401,26 @@ mod tests {
         assert!(out.contains("module_statement"));
         assert!(out.contains("sub_statement"));
         assert!(out.contains("function_statement"));
+    }
+
+    #[test]
+    fn function_range_includes_end_function_line() {
+        let source = "Module HelloWorld\n\
+    Function Multiply(a As Integer, b As Integer) As Integer\n\
+        Return a * b\n\
+    End Function\n\
+End Module\n";
+        let out = process_impl(source);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let function = &value["children"][0]["children"][0];
+
+        assert_eq!(function["node_type"], "function_statement");
+        assert_eq!(function["position"]["start_line"], 1);
+        assert_eq!(function["position"]["end_line"], 3);
+        assert_eq!(
+            function["position"]["end_col"],
+            "End Function".len() as u64
+        );
     }
 
     #[test]
