@@ -12,3 +12,35 @@ jobs:
   ci:
     uses: buchochelliq-labs/intentumdiff-plugin-sdk/.github/workflows/parser-ci.yml@main
     secrets: inherit
+
+  # Release-candidate proof: compute the inner component checksum from the
+  # exact successful main-branch parser run, not from a moving PR build or ZIP.
+  pinned-wasm-checksum:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Attest source SHA and calculate inner Wasm SHA-256
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repository="buchochelliq-labs/intentumdiff-vbnet-parser"
+          source_sha="8266dfc920fc3a42215b7fc55952ed413ddebef1"
+          artifact_id="12699271112"
+          run_id="40423063801"
+          metadata="$(gh api "repos/$repository/actions/artifacts/$artifact_id")"
+          test "$(jq -r '.workflow_run.head_sha' <<<"$metadata")" = "$source_sha"
+          test "$(jq -r '.workflow_run.id' <<<"$metadata")" = "$run_id"
+          test "$(jq -r '.expired' <<<"$metadata")" = "false"
+          mkdir -p "$RUNNER_TEMP/pinned-wasm"
+          gh run download "$run_id" --repo "$repository" --name parser-wasm --dir "$RUNNER_TEMP/pinned-wasm"
+          mapfile -t files < <(find "$RUNNER_TEMP/pinned-wasm" -type f -name '*.wasm' | sort)
+          test "${#files[@]}" -eq 1
+          echo "source_ref=$source_sha"
+          echo "artifact_id=$artifact_id"
+          echo "component_name=$(basename "${files[0]}")"
+          sha256sum "${files[0]}"
+          echo "Use only the SHA printed above for the registry's inner Wasm checksum; the archive digest is not interchangeable."
