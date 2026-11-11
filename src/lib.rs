@@ -107,6 +107,15 @@ fn lower_trimmed(line: &str) -> String {
     strip_inline_comment(line).trim().to_ascii_lowercase()
 }
 
+/// Whether a physical line carries no code: blank, a `'` comment, or a
+/// `Rem` comment (`Rem` alone or followed by whitespace).
+fn is_trivia_line(line: &str) -> bool {
+    let lower = lower_trimmed(line);
+    lower.is_empty()
+        || lower == "rem"
+        || (lower.starts_with("rem") && lower[3..].starts_with(char::is_whitespace))
+}
+
 fn is_class_like(node_type: &str) -> bool {
     matches!(
         node_type,
@@ -233,24 +242,53 @@ fn parse_header(line: &str) -> Option<DeclHeader> {
     None
 }
 
-/// Collapse whitespace runs outside string literals so layout-only edits
-/// inside a signature stay style-only while every token is preserved.
+/// Whether canonical signature text puts one space between `prev` (the last
+/// character emitted outside a string) and `ch`. Spacing next to brackets and
+/// commas is layout (`F( x As Integer )` is `F(x As Integer)`); a comma, `=`
+/// and a word after a closing bracket get exactly one space; elsewhere the
+/// source's whitespace (collapsed to one space) separates words.
+fn signature_space(prev: Option<char>, ch: char, pending: bool) -> bool {
+    let Some(prev) = prev else { return false };
+    if matches!(prev, '(' | '{') || matches!(ch, ')' | '}' | ',' | '(') {
+        return false;
+    }
+    if matches!(prev, ',' | '=') || ch == '=' {
+        return true;
+    }
+    if matches!(prev, ')' | '}') {
+        return ch.is_alphanumeric() || matches!(ch, '_' | '"' | '[');
+    }
+    pending
+}
+
+/// Canonical signature text: whitespace outside string literals is reduced to
+/// the spacing `signature_space` decides, so layout-only edits stay
+/// style-only while every token, and all spacing inside string literals, is
+/// preserved.
 fn collapse_ws(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_string = false;
     let mut pending_space = false;
+    let mut prev: Option<char> = None;
     for ch in text.trim().chars() {
-        if ch == '"' {
-            in_string = !in_string;
+        if in_string {
+            out.push(ch);
+            if ch == '"' {
+                in_string = false;
+                prev = Some(ch);
+            }
+            continue;
         }
-        if !in_string && ch.is_whitespace() {
+        if ch.is_whitespace() {
             pending_space = true;
             continue;
         }
-        if pending_space {
+        if signature_space(prev, ch, pending_space) {
             out.push(' ');
-            pending_space = false;
         }
+        pending_space = false;
+        in_string = ch == '"';
+        prev = Some(ch);
         out.push(ch);
     }
     out
@@ -281,8 +319,9 @@ fn has_body(
         // A property block's first significant line is a Get or Set accessor.
         let next_code = lines[next.min(lines.len())..]
             .iter()
+            .filter(|l| !is_trivia_line(l))
             .map(|l| strip_inline_comment(l).trim())
-            .find(|l| !l.is_empty());
+            .next();
         let Some(next_code) = next_code else {
             return false;
         };
@@ -296,10 +335,10 @@ fn has_body(
 }
 
 fn statement_kind(line: &str) -> Option<&'static str> {
-    let lower = lower_trimmed(line);
-    if lower.is_empty() || lower.starts_with('\'') || lower.starts_with("rem ") {
+    if is_trivia_line(line) {
         return None;
     }
+    let lower = lower_trimmed(line);
     if lower.starts_with("imports ") {
         return Some("imports_statement");
     }
@@ -339,7 +378,7 @@ fn parse_nodes(
                 break;
             }
         }
-        if lower.is_empty() || lower.starts_with('\'') || lower.starts_with("rem ") {
+        if is_trivia_line(line) {
             *index += 1;
             continue;
         }
@@ -695,10 +734,63 @@ End Module\n";
         let w = tree("Public Function F( x  As Integer )   As Integer\nReturn x\nEnd Function\n");
         assert_eq!(
             all(&w, "signature")[0]["label"],
-            "( x As Integer ) As Integer"
+            "(x As Integer) As Integer"
         );
+        assert_eq!(w["structural_hash"], o["structural_hash"]);
         let r = tree("Public Function F(x As Integer) As Integer ' doc\nReturn x\nEnd Function\n");
         assert_eq!(r["structural_hash"], o["structural_hash"]);
+    }
+
+    // Issue #9: a `Rem` comment before the first accessor is trivia.
+    #[test]
+    fn rem_comment_before_property_accessor_keeps_body() {
+        let plain = "Class C\n    Property P As Integer\n        Get\n            Return 1\n        End Get\n    End Property\nEnd Class\n";
+        let rem = "Class C\n    Property P As Integer\n        Rem documentation\n        Get\n            Return 1\n        End Get\n    End Property\nEnd Class\n";
+        let bare = "Class C\n    Property P As Integer\n        REM\n        ' note\n        Get\n            Return 1\n        End Get\n    End Property\nEnd Class\n";
+        let (a, b, c) = (tree(plain), tree(rem), tree(bare));
+        for t in [&b, &c] {
+            let p = all(t, "property_statement")[0];
+            assert_eq!(all(p, "return_statement").len(), 1, "Get body stays under the property");
+            assert!(all(p, "expression_statement").iter().any(|n| n["label"] == "Get"));
+            let class = all(t, "class_statement")[0];
+            assert_eq!(class["children"].as_array().unwrap().len(), 1);
+            assert_eq!(t["structural_hash"], a["structural_hash"]);
+        }
+        let pa = all(&a, "property_statement")[0];
+        let pb = all(&b, "property_statement")[0];
+        assert_eq!(pa["label"], pb["label"]);
+        assert_eq!(pa["structural_hash"], pb["structural_hash"]);
+        assert_eq!(pos(pb), (1, 4, 6, 16));
+    }
+
+    // Issue #10: spacing around signature punctuation is layout.
+    #[test]
+    fn signature_punctuation_spacing_is_not_semantic() {
+        let o = tree("Function F(x As Integer)\nReturn x\nEnd Function\n");
+        let n = tree("Function F( x As Integer )\nReturn x\nEnd Function\n");
+        assert_eq!(all(&o, "signature")[0]["label"], "(x As Integer)");
+        assert_eq!(all(&n, "signature")[0]["label"], "(x As Integer)");
+        assert_eq!(o["structural_hash"], n["structural_hash"]);
+        let o = tree("Sub S(a As Integer, Optional b As String = \"x  y\")\nEnd Sub\n");
+        let n = tree("Sub S (  a As Integer ,Optional b As String=\"x  y\" )\nEnd Sub\n");
+        assert_eq!(
+            all(&o, "signature")[0]["label"],
+            "(a As Integer, Optional b As String = \"x  y\")"
+        );
+        assert_eq!(all(&o, "signature")[0]["label"], all(&n, "signature")[0]["label"]);
+        assert_eq!(o["structural_hash"], n["structural_hash"]);
+        // Spacing inside a string default is payload.
+        let s = tree("Sub S(Optional b As String = \"x y\")\nEnd Sub\n");
+        assert_ne!(all(&s, "signature")[0]["label"], all(&o, "signature")[0]["label"]);
+        let s1 = tree("Sub S(Optional b As String = \"x y\")\nEnd Sub\n");
+        let s2 = tree("Sub S(Optional b As String = \"x  y\")\nEnd Sub\n");
+        assert_ne!(s1["structural_hash"], s2["structural_hash"]);
+        // Renames and type changes are still meaningful.
+        let base = tree("Function F(x As Integer)\nReturn x\nEnd Function\n");
+        let renamed = tree("Function F( y As Integer )\nReturn x\nEnd Function\n");
+        let retyped = tree("Function F( x As Long )\nReturn x\nEnd Function\n");
+        assert_ne!(base["structural_hash"], renamed["structural_hash"]);
+        assert_ne!(base["structural_hash"], retyped["structural_hash"]);
     }
 
     #[test]
