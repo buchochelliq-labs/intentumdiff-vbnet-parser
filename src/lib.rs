@@ -107,6 +107,15 @@ fn lower_trimmed(line: &str) -> String {
     strip_inline_comment(line).trim().to_ascii_lowercase()
 }
 
+/// Whether a physical line carries no code: blank, a `'` comment, or a
+/// `Rem` comment (`Rem` alone or followed by whitespace).
+fn is_trivia_line(line: &str) -> bool {
+    let lower = lower_trimmed(line);
+    lower.is_empty()
+        || lower == "rem"
+        || (lower.starts_with("rem") && lower[3..].starts_with(char::is_whitespace))
+}
+
 fn is_class_like(node_type: &str) -> bool {
     matches!(
         node_type,
@@ -281,8 +290,9 @@ fn has_body(
         // A property block's first significant line is a Get or Set accessor.
         let next_code = lines[next.min(lines.len())..]
             .iter()
+            .filter(|l| !is_trivia_line(l))
             .map(|l| strip_inline_comment(l).trim())
-            .find(|l| !l.is_empty());
+            .next();
         let Some(next_code) = next_code else {
             return false;
         };
@@ -296,10 +306,10 @@ fn has_body(
 }
 
 fn statement_kind(line: &str) -> Option<&'static str> {
-    let lower = lower_trimmed(line);
-    if lower.is_empty() || lower.starts_with('\'') || lower.starts_with("rem ") {
+    if is_trivia_line(line) {
         return None;
     }
+    let lower = lower_trimmed(line);
     if lower.starts_with("imports ") {
         return Some("imports_statement");
     }
@@ -339,7 +349,7 @@ fn parse_nodes(
                 break;
             }
         }
-        if lower.is_empty() || lower.starts_with('\'') || lower.starts_with("rem ") {
+        if is_trivia_line(line) {
             *index += 1;
             continue;
         }
@@ -699,6 +709,28 @@ End Module\n";
         );
         let r = tree("Public Function F(x As Integer) As Integer ' doc\nReturn x\nEnd Function\n");
         assert_eq!(r["structural_hash"], o["structural_hash"]);
+    }
+
+    // Issue #9: a `Rem` comment before the first accessor is trivia.
+    #[test]
+    fn rem_comment_before_property_accessor_keeps_body() {
+        let plain = "Class C\n    Property P As Integer\n        Get\n            Return 1\n        End Get\n    End Property\nEnd Class\n";
+        let rem = "Class C\n    Property P As Integer\n        Rem documentation\n        Get\n            Return 1\n        End Get\n    End Property\nEnd Class\n";
+        let bare = "Class C\n    Property P As Integer\n        REM\n        ' note\n        Get\n            Return 1\n        End Get\n    End Property\nEnd Class\n";
+        let (a, b, c) = (tree(plain), tree(rem), tree(bare));
+        for t in [&b, &c] {
+            let p = all(t, "property_statement")[0];
+            assert_eq!(all(p, "return_statement").len(), 1, "Get body stays under the property");
+            assert!(all(p, "expression_statement").iter().any(|n| n["label"] == "Get"));
+            let class = all(t, "class_statement")[0];
+            assert_eq!(class["children"].as_array().unwrap().len(), 1);
+            assert_eq!(t["structural_hash"], a["structural_hash"]);
+        }
+        let pa = all(&a, "property_statement")[0];
+        let pb = all(&b, "property_statement")[0];
+        assert_eq!(pa["label"], pb["label"]);
+        assert_eq!(pa["structural_hash"], pb["structural_hash"]);
+        assert_eq!(pos(pb), (1, 4, 6, 16));
     }
 
     #[test]
